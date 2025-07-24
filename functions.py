@@ -8,7 +8,15 @@ import json
 import time
 import PyPDF2
 from pypdf import PdfReader
-import fitz
+from typing import Dict, List, Optional, Tuple
+import re
+
+# Tentative d'import de fitz, mais pas critique si ça échoue
+try:
+    import fitz
+    FITZ_AVAILABLE = True
+except ImportError:
+    FITZ_AVAILABLE = False
 
 # Récupération des IDs des agents à partir de st.secrets
 try:
@@ -63,7 +71,7 @@ AGENTS = {
 def get_bedrock_client():
     """Initialise et retourne le client Bedrock avec credentials explicites"""
     try:
-        # Configuration pour gérer les timeouts longs
+        # Configuration pour gérer les timeouts longs et le streaming
         config = Config(
             read_timeout=3600,  # 1 heure pour les réponses longues
             connect_timeout=60,
@@ -124,25 +132,12 @@ async def test_router_connection():
             enableTrace=True  # Important pour voir les traces de collaboration
         )
 
-        # Extraire la réponse en gérant les traces multi-agent
-        full_response = ""
+        # Parser la réponse avec la nouvelle méthode
+        parsed_response = parse_multi_agent_response_complete(response)
         
-        for event in response["completion"]:
-            if "chunk" in event:
-                chunk = event["chunk"]
-                if "bytes" in chunk:
-                    try:
-                        chunk_data = json.loads(chunk["bytes"].decode('utf-8'))
-                        if "text" in chunk_data:
-                            full_response += chunk_data["text"]
-                    except json.JSONDecodeError:
-                        full_response += chunk["bytes"].decode('utf-8')
-                elif "text" in chunk:
-                    full_response += chunk["text"]
-
         return {
             "success": True,
-            "response": full_response.strip(),
+            "response": parsed_response["final_response"],
             "note": "Agent routeur opérationnel. La collaboration multi-agent se fait automatiquement."
         }
 
@@ -153,74 +148,170 @@ async def test_router_connection():
             "solution": "Vérifiez que l'agent routeur est configuré avec 'Multi-agent collaboration' activé dans Bedrock."
         }
 
-# FONCTION CORRIGÉE pour parser les traces multi-agent
-def parse_multi_agent_traces(response):
+# NOUVELLE FONCTION COMPLÈTE pour parser les réponses multi-agent
+def parse_multi_agent_response_complete(response: Dict) -> Dict:
     """
-    Parse les traces de collaboration multi-agent pour extraire les vraies réponses
+    Parse complète des réponses multi-agent basée sur les patterns AWS officiels
+    Gère les traces, les réponses des collaborateurs et les erreurs RerunData
     """
-    collaborator_responses = []
-    final_response = ""
-    trace_info = []
-    
-    for event in response.get("completion", []):
-        # Traiter les traces (contiennent les réponses des agents collaborateurs)
-        if "trace" in event:
-            trace = event["trace"]
-            if "trace" in trace:
-                trace_data = trace["trace"]
-                
-                # Vérifier les traces d'orchestration
-                if "orchestrationTrace" in trace_data:
-                    orch_trace = trace_data["orchestrationTrace"]
-                    
-                    # Chercher les observations (réponses des agents collaborateurs)
-                    if "observation" in orch_trace:
-                        observation = orch_trace["observation"]
-                        
-                        # Si c'est une réponse d'agent collaborateur
-                        if observation.get("type") == "AGENT_COLLABORATOR" and "agentCollaboratorInvocationOutput" in observation:
-                            collab_output = observation["agentCollaboratorInvocationOutput"]
-                            collab_name = collab_output.get("agentCollaboratorName", "Unknown")
-                            
-                            # Extraire la vraie réponse de l'agent collaborateur
-                            if "output" in collab_output and "text" in collab_output["output"]:
-                                response_text = collab_output["output"]["text"]
-                                collaborator_responses.append({
-                                    "agent": collab_name,
-                                    "response": response_text
-                                })
-                                trace_info.append(f"✅ Réponse de {collab_name}: {response_text[:100]}...")
-                        
-                        # Si c'est la réponse finale
-                        elif observation.get("type") == "FINISH" and "finalResponse" in observation:
-                            if "text" in observation["finalResponse"]:
-                                final_response = observation["finalResponse"]["text"]
-        
-        # Traiter les chunks (réponse finale consolidée)
-        elif "chunk" in event:
-            chunk = event["chunk"]
-            if "bytes" in chunk:
-                try:
-                    chunk_data = json.loads(chunk["bytes"].decode('utf-8'))
-                    if "text" in chunk_data:
-                        final_response += chunk_data["text"]
-                except json.JSONDecodeError:
-                    chunk_text = chunk["bytes"].decode('utf-8')
-                    if chunk_text.strip():
-                        final_response += chunk_text
-            elif "text" in chunk:
-                final_response += chunk["text"]
-    
-    return {
-        "collaborator_responses": collaborator_responses,
-        "final_response": final_response.strip(),
-        "trace_info": trace_info
+    result = {
+        "final_response": "",
+        "collaborator_responses": {},
+        "orchestration_steps": [],
+        "trace_info": [],
+        "errors": []
     }
+    
+    try:
+        # Parcourir tous les événements dans la réponse
+        for event in response.get("completion", []):
+            
+            # 1. Traiter les chunks (réponse finale)
+            if "chunk" in event and event["chunk"]:
+                chunk = event["chunk"]
+                if "bytes" in chunk:
+                    decoded_bytes = chunk["bytes"].decode('utf-8')
+                    
+                    # Filtrer les erreurs RerunData
+                    if "RerunData" in decoded_bytes:
+                        result["errors"].append("RerunData error detected and filtered")
+                        continue
+                    
+                    # Essayer de parser comme JSON d'abord
+                    try:
+                        chunk_data = json.loads(decoded_bytes)
+                        if "text" in chunk_data:
+                            result["final_response"] += chunk_data["text"]
+                    except json.JSONDecodeError:
+                        # Si ce n'est pas du JSON, ajouter tel quel
+                        if decoded_bytes.strip():
+                            result["final_response"] += decoded_bytes
+            
+            # 2. Traiter les traces (contiennent les réponses des collaborateurs)
+            elif "trace" in event:
+                trace_part = event["trace"]
+                
+                # Extraire les informations du collaborateur
+                collaborator_name = trace_part.get("collaboratorName")
+                caller_chain = trace_part.get("callerChain", [])
+                
+                # Si on a un nom de collaborateur, l'ajouter aux infos
+                if collaborator_name:
+                    result["trace_info"].append(f"Trace from: {collaborator_name}")
+                
+                # Parser le contenu de la trace
+                if "trace" in trace_part:
+                    trace_content = trace_part["trace"]
+                    
+                    # Traiter les traces de pré-processing
+                    if "preProcessingTrace" in trace_content:
+                        pre_trace = trace_content["preProcessingTrace"]
+                        if "modelInvocationInput" in pre_trace:
+                            input_text = pre_trace["modelInvocationInput"].get("text", "")
+                            result["orchestration_steps"].append({
+                                "type": "pre_processing",
+                                "input": input_text[:200] + "..." if len(input_text) > 200 else input_text
+                            })
+                    
+                    # Traiter les traces d'orchestration (CRITIQUE pour multi-agent)
+                    if "orchestrationTrace" in trace_content:
+                        orch_trace = trace_content["orchestrationTrace"]
+                        
+                        # Extraire le raisonnement
+                        if "modelInvocationInput" in orch_trace:
+                            reasoning = orch_trace["modelInvocationInput"].get("text", "")
+                            result["orchestration_steps"].append({
+                                "type": "orchestration",
+                                "reasoning": reasoning[:300] + "..." if len(reasoning) > 300 else reasoning
+                            })
+                        
+                        # EXTRAIRE LES RÉPONSES DES AGENTS COLLABORATEURS
+                        if "observation" in orch_trace:
+                            observation = orch_trace["observation"]
+                            obs_type = observation.get("type", "")
+                            
+                            # Si c'est une réponse d'agent collaborateur
+                            if obs_type == "AGENT_COLLABORATOR" and "agentCollaboratorInvocationOutput" in observation:
+                                collab_output = observation["agentCollaboratorInvocationOutput"]
+                                
+                                # Extraire le nom et la réponse du collaborateur
+                                collab_name = collab_output.get("agentCollaboratorName", "Unknown")
+                                collab_alias = collab_output.get("agentCollaboratorAliasArn", "")
+                                
+                                # Extraire la réponse textuelle
+                                if "output" in collab_output:
+                                    output_text = collab_output["output"].get("text", "")
+                                    
+                                    # Stocker la réponse du collaborateur
+                                    result["collaborator_responses"][collab_name] = {
+                                        "response": output_text,
+                                        "alias": collab_alias
+                                    }
+                                    
+                                    # Ajouter à l'orchestration
+                                    result["orchestration_steps"].append({
+                                        "type": "collaborator_response",
+                                        "agent": collab_name,
+                                        "response_preview": output_text[:200] + "..." if len(output_text) > 200 else output_text
+                                    })
+                            
+                            # Si c'est une action group
+                            elif obs_type == "ACTION_GROUP" and "actionGroupInvocationOutput" in observation:
+                                action_output = observation["actionGroupInvocationOutput"]
+                                action_text = action_output.get("text", "")
+                                result["orchestration_steps"].append({
+                                    "type": "action_group",
+                                    "output": action_text[:200] + "..." if len(action_text) > 200 else action_text
+                                })
+                            
+                            # Si c'est une recherche knowledge base
+                            elif obs_type == "KNOWLEDGE_BASE" and "knowledgeBaseLookupOutput" in observation:
+                                kb_output = observation["knowledgeBaseLookupOutput"]
+                                references = kb_output.get("retrievedReferences", [])
+                                result["orchestration_steps"].append({
+                                    "type": "knowledge_base",
+                                    "references_count": len(references)
+                                })
+                            
+                            # Si c'est la réponse finale
+                            elif obs_type == "FINISH" and "finalResponse" in observation:
+                                final_text = observation["finalResponse"].get("text", "")
+                                if final_text and not result["final_response"]:
+                                    result["final_response"] = final_text
+                    
+                    # Traiter les traces post-processing
+                    if "postProcessingTrace" in trace_content:
+                        post_trace = trace_content["postProcessingTrace"]
+                        if "modelInvocationOutput" in post_trace:
+                            parsed_response = post_trace["modelInvocationOutput"].get("parsedResponse", {})
+                            result["orchestration_steps"].append({
+                                "type": "post_processing",
+                                "output": str(parsed_response)[:200] + "..." if len(str(parsed_response)) > 200 else str(parsed_response)
+                            })
+    
+    except Exception as e:
+        result["errors"].append(f"Erreur lors du parsing: {str(e)}")
+        st.error(f"Erreur de parsing des traces: {e}")
+    
+    # Si pas de réponse finale mais des réponses de collaborateurs, les consolider
+    if not result["final_response"] and result["collaborator_responses"]:
+        consolidated = []
+        for agent_name, agent_data in result["collaborator_responses"].items():
+            agent_icon = "🤖"
+            # Trouver l'icône correspondante
+            for key, info in AGENTS.items():
+                if agent_name.lower() in info["name"].lower() or key in agent_name.lower():
+                    agent_icon = info["icon"]
+                    break
+            consolidated.append(f"{agent_icon} **{agent_name}**:\n{agent_data['response']}")
+        result["final_response"] = "\n\n".join(consolidated)
+    
+    return result
 
-# FONCTION PRINCIPALE CORRIGÉE pour gérer multi-agent collaboration
+# FONCTION PRINCIPALE AMÉLIORÉE pour gérer multi-agent collaboration
 async def execute_agent(agent_key, agent_info, message_content):
     """
-    Exécute un agent spécifique avec Bedrock - Gestion spéciale pour multi-agent
+    Exécute un agent spécifique avec Bedrock - Version complète avec parsing avancé
     """
     max_retries = 3
     retry_delay = 2
@@ -247,62 +338,76 @@ async def execute_agent(agent_key, agent_info, message_content):
                 agentAliasId=AGENT_ALIAS_IDS[agent_key],
                 sessionId=current_session_id,
                 inputText=message_content,
-                enableTrace=True  # CRITIQUE pour multi-agent collaboration
+                enableTrace=True,  # CRITIQUE pour multi-agent collaboration
+                endSession=False   # Garder la session ouverte
             )
 
-            # Si c'est l'agent routeur, parser spécialement les traces multi-agent
-            if agent_key == "router":
-                parsed_response = parse_multi_agent_traces(response)
-                
-                # Debug info si activé
-                if st.session_state.debug_mode:
-                    if parsed_response["trace_info"]:
-                        st.info("🔍 Traces de collaboration multi-agent:")
-                        for trace in parsed_response["trace_info"]:
-                            st.write(f"  - {trace}")
-                
-                # Construire la réponse finale
-                if parsed_response["collaborator_responses"]:
-                    # S'il y a des réponses d'agents collaborateurs
-                    responses_text = []
-                    for collab in parsed_response["collaborator_responses"]:
-                        responses_text.append(f"**{collab['agent']}**:\n{collab['response']}")
-                    
-                    # Si pas de réponse finale consolidée, utiliser les réponses des collaborateurs
-                    if not parsed_response["final_response"]:
-                        return "\n\n".join(responses_text)
-                    else:
-                        # Sinon retourner la réponse finale consolidée
-                        return parsed_response["final_response"]
-                else:
-                    # Si pas de réponses de collaborateurs, retourner la réponse finale
-                    return parsed_response["final_response"] if parsed_response["final_response"] else f"Pas de réponse de {agent_name}"
+            # Utiliser le nouveau parser complet
+            parsed_response = parse_multi_agent_response_complete(response)
             
+            # Si mode debug, afficher les détails de l'orchestration
+            if st.session_state.debug_mode:
+                # Afficher les étapes d'orchestration
+                if parsed_response["orchestration_steps"]:
+                    st.info("🔍 Étapes d'orchestration:")
+                    for step in parsed_response["orchestration_steps"]:
+                        if step["type"] == "orchestration":
+                            st.write(f"  📋 Raisonnement: {step['reasoning']}")
+                        elif step["type"] == "collaborator_response":
+                            st.write(f"  ✅ Réponse de {step['agent']}: {step['response_preview']}")
+                        elif step["type"] == "action_group":
+                            st.write(f"  ⚡ Action: {step['output']}")
+                        elif step["type"] == "knowledge_base":
+                            st.write(f"  📚 Knowledge Base: {step['references_count']} références trouvées")
+                
+                # Afficher les erreurs filtrées
+                if parsed_response["errors"]:
+                    st.warning(f"⚠️ Erreurs filtrées: {', '.join(parsed_response['errors'])}")
+            
+            # Si c'est l'agent routeur, formater spécialement la réponse
+            if agent_key == "router" and parsed_response["collaborator_responses"]:
+                # Créer une belle réponse consolidée
+                sections = []
+                
+                # Ajouter un résumé si disponible
+                if parsed_response["final_response"]:
+                    sections.append("## 📊 Synthèse de l'orchestration\n" + parsed_response["final_response"])
+                
+                # Ajouter les réponses des collaborateurs
+                if parsed_response["collaborator_responses"]:
+                    sections.append("\n## 🤝 Réponses des agents collaborateurs")
+                    for agent_name, agent_data in parsed_response["collaborator_responses"].items():
+                        # Trouver l'icône de l'agent
+                        agent_icon = "🤖"
+                        for key, info in AGENTS.items():
+                            if agent_name.lower() in info["name"].lower() or key in agent_name.lower():
+                                agent_icon = info["icon"]
+                                break
+                        
+                        sections.append(f"\n### {agent_icon} {agent_name}\n{agent_data['response']}")
+                
+                return "\n".join(sections)
             else:
-                # Pour les autres agents (non-routeur), traitement standard
-                full_response = ""
-                for event in response["completion"]:
-                    if "chunk" in event:
-                        chunk = event["chunk"]
-                        if "bytes" in chunk:
-                            try:
-                                chunk_data = json.loads(chunk["bytes"].decode('utf-8'))
-                                if "text" in chunk_data:
-                                    full_response += chunk_data["text"]
-                            except json.JSONDecodeError:
-                                full_response += chunk["bytes"].decode('utf-8')
-                        elif "text" in chunk:
-                            full_response += chunk["text"]
-
-                return full_response.strip() if full_response.strip() else f"Pas de réponse de {agent_name}"
+                # Pour les autres agents, retourner simplement la réponse finale
+                return parsed_response["final_response"] if parsed_response["final_response"] else f"Pas de réponse de {agent_name}"
 
         except Exception as e:
-            if "throttling" in str(e).lower() and attempt < max_retries - 1:
-                st.warning(f"Ralentissement Bedrock, nouvel essai dans {retry_delay * (attempt + 1)} secondes...")
-                await asyncio.sleep(retry_delay * (attempt + 1))
+            error_str = str(e).lower()
+            
+            # Gestion spécifique du throttling
+            if "throttling" in error_str and attempt < max_retries - 1:
+                wait_time = retry_delay * (attempt + 1)
+                st.warning(f"⏳ Limite de débit atteinte. Nouvelle tentative dans {wait_time} secondes...")
+                await asyncio.sleep(wait_time)
                 continue
+            
+            # Gestion des autres erreurs communes
+            elif "accessdenied" in error_str:
+                return f"❌ Accès refusé pour {agent_name}. Vérifiez les permissions IAM."
+            elif "resourcenotfound" in error_str:
+                return f"❌ Agent {agent_name} non trouvé. Vérifiez l'ID et l'alias."
             else:
-                error_msg = f"Erreur lors de l'exécution de {agent_info['name']}: {e}"
+                error_msg = f"❌ Erreur lors de l'exécution de {agent_info['name']}: {e}"
                 st.error(error_msg)
                 return error_msg
 
@@ -367,7 +472,8 @@ async def run_specific_agent(query, agent_key):
             "selected_agent": agent_key,
             "agent_name": agent_name,
             "agent_icon": agent_icon,
-            "combined": response
+            "combined": response,
+            "selection_method": "Agent unique sélectionné manuellement"
         }
 
     except Exception as e:
@@ -376,16 +482,17 @@ async def run_specific_agent(query, agent_key):
 # FONCTION PRINCIPALE SIMPLIFIÉE
 async def run_workflow_based_on_mode(query, mode):
     """
-    Version SIMPLIFIÉE - L'agent router gère automatiquement la collaboration
+    Version complète avec support multi-agent avancé
     """
     if mode == "intelligent":
         st.session_state.progress_text = f"🎯 Agent Routeur: Orchestration multi-agent en cours..."
         
-        # TRAITEMENT IDENTIQUE - Le router gère automatiquement ses collaborateurs
+        # Le router gère automatiquement ses collaborateurs
         response = await run_specific_agent(query, "router")
         
         # Ajouter des informations spécifiques au routeur
         response["selection_method"] = "Orchestration Multi-Agent Automatique"
+        response["router_response"] = "Orchestration complète avec collaboration multi-agent"
         return response
         
     elif mode == "sequence":
@@ -405,40 +512,53 @@ def run_async_function(func, *args, **kwargs):
     finally:
         loop.close()
 
-# Fonctions pour extraction de texte PDF (inchangées)
+# Fonctions pour extraction de texte PDF MODIFIÉES
 def extract_text_from_pdf_ocr(pdf_document):
-    """for OCR"""
-    text = ""
-    for page_num in range(pdf_document.page_count):
-        page = pdf_document.load_page(page_num)
-        text += page.get_text()
-    return text
+    """for OCR - utilise fitz si disponible"""
+    if FITZ_AVAILABLE:
+        text = ""
+        for page_num in range(pdf_document.page_count):
+            page = pdf_document.load_page(page_num)
+            text += page.get_text()
+        return text
+    else:
+        # Fallback vers pypdf si fitz n'est pas disponible
+        return None
 
 def extract_text_from_pdf(uploaded_file, ocr):
-    if (uploaded_file is not None) and ocr:
+    """Extraction de texte avec gestion de fitz optionnel"""
+    if uploaded_file is not None:
         file_name = uploaded_file.name
-        pdf_document = fitz.open(stream=uploaded_file.read(), filetype="pdf")
-        extracted_text = extract_text_from_pdf_ocr(pdf_document)
-        raw_text = extracted_text
-        return raw_text, file_name
-    else:
-        if uploaded_file is not None:
-            file_name = uploaded_file.name
-            if uploaded_file.type == "text/plain":
-                raw_text = str(uploaded_file.read(),"utf-8")
-            elif uploaded_file.type == "application/pdf":
-                reader = PdfReader(uploaded_file)
-                text = ""
-                for page in reader.pages:
-                    text += page.extract_text() + "\n"
-                raw_text = text
-            else:
-                raw_text = ""
-                file_name = None
+        
+        # Si OCR demandé ET fitz disponible
+        if ocr and FITZ_AVAILABLE:
+            try:
+                pdf_document = fitz.open(stream=uploaded_file.read(), filetype="pdf")
+                raw_text = extract_text_from_pdf_ocr(pdf_document)
+                if raw_text:
+                    return raw_text, file_name
+            except Exception as e:
+                st.warning(f"Erreur OCR avec fitz: {e}. Utilisation de pypdf.")
+        
+        # Réinitialiser le pointeur du fichier
+        uploaded_file.seek(0)
+        
+        # Utiliser pypdf (toujours disponible)
+        if uploaded_file.type == "text/plain":
+            raw_text = str(uploaded_file.read(), "utf-8")
+        elif uploaded_file.type == "application/pdf":
+            reader = PdfReader(uploaded_file)
+            text = ""
+            for page in reader.pages:
+                text += page.extract_text() + "\n"
+            raw_text = text
         else:
             raw_text = ""
             file_name = None
-    return raw_text, file_name
+            
+        return raw_text, file_name
+    else:
+        return "", None
 
 def extract_text_from_multiple_files(uploaded_files, ocr):
     """extract text from multiple files and return a list of file text"""
