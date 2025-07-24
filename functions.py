@@ -112,8 +112,8 @@ async def diagnose_router_agent():
         
         session_id = get_or_create_session_id()
         
-        # Test simple d'orchestration
-        test_query = "Please orchestrate with your collaborator agents to provide a brief overview of contract management best practices. This should involve multiple agents working together."
+        # Test avec prompt d'exécution forcée
+        test_query = "EXECUTE NOW: Invoke your collaborator agents to provide contract management insights. Do not plan - execute immediately."
         
         response = client.invoke_agent(
             agentId=AGENT_IDS["router"],
@@ -187,8 +187,8 @@ async def test_router_connection():
         
         session_id = get_or_create_session_id()
         
-        # Test d'orchestration réel
-        test_prompt = "Please orchestrate with your collaborator agents to analyze contract management best practices. This requires multi-agent collaboration."
+        # Test d'orchestration réel avec prompt forcé
+        test_prompt = "EXECUTE NOW: Call your collaborator agents to analyze contract management best practices. Do not plan - execute the collaboration immediately."
         
         response = client.invoke_agent(
             agentId=AGENT_IDS["router"],
@@ -250,9 +250,12 @@ def parse_multi_agent_response_complete(response: Dict) -> Dict:
                         decoded = chunk["bytes"].decode('utf-8')
                         result["raw_chunks"].append(decoded)
                         
-                        # Filtrer les erreurs système
-                        if any(error in decoded for error in ["RerunData", "InternalServerError", "ValidationException"]):
-                            result["errors"].append(f"Erreur système filtrée: {decoded[:100]}")
+                        # Filtrer les erreurs système mais continuer le traitement
+                        if "RerunData" in decoded:
+                            result["errors"].append("RerunData filtered")
+                            continue
+                        if any(error in decoded for error in ["InternalServerError", "ValidationException"]):
+                            result["errors"].append(f"System error filtered: {decoded[:50]}")
                             continue
                         
                         # Essayer JSON puis texte brut
@@ -433,13 +436,11 @@ async def execute_agent(agent_key, agent_info, message_content):
                 "endSession": False
             }
             
-            # Pour l'agent routeur, ajouter des paramètres spécifiques
+            # Pour l'agent routeur, forcer l'exécution réelle
             if agent_key == "router":
-                # S'assurer que l'orchestration est activée
                 invoke_params["enableTrace"] = True
-                # Ajouter un contexte pour l'orchestration
-                if "Orchestrate" not in message_content and "collaborate" not in message_content.lower():
-                    invoke_params["inputText"] = f"Please orchestrate and collaborate with appropriate agents to handle this request: {message_content}"
+                # Prompt spécifique pour forcer l'exécution
+                invoke_params["inputText"] = f"EXECUTE (do not just plan): Collaborate with your agents to handle: {message_content}. You must actually invoke your collaborator agents, not just describe what you would do."
             
             response = client.invoke_agent(**invoke_params)
 
@@ -492,11 +493,14 @@ async def execute_agent(agent_key, agent_info, message_content):
                     
                     return "\n".join(sections)
                 else:
-                    # Pas de collaboration détectée - retourner la réponse directe
-                    if parsed_response["final_response"]:
-                        return f"🎯 **Agent Routeur (Réponse Directe):**\n\n{parsed_response['final_response']}"
+                    # Détecter si c'est une simulation au lieu d'une exécution
+                    response_text = parsed_response["final_response"]
+                    simulation_keywords = ["orchestration_sequence", "reasoning", "workflow_type", "let me prepare", "proceed with"]
+                    
+                    if any(keyword in response_text.lower() for keyword in simulation_keywords):
+                        return f"⚠️ **SIMULATION DÉTECTÉE** - L'agent routeur planifie au lieu d'exécuter.\n\n**Réponse reçue:**\n{response_text}\n\n**Solution:** Vérifiez que l'agent routeur est configuré pour exécuter réellement ses collaborateurs dans AWS Bedrock."
                     else:
-                        return f"⚠️ L'agent routeur n'a pas généré de réponse. Vérifiez la configuration multi-agent."
+                        return f"🎯 **Agent Routeur (Réponse Directe):**\n\n{response_text}" if response_text else f"⚠️ Pas de réponse du routeur."
             else:
                 # Autres agents - réponse standard
                 return parsed_response["final_response"] if parsed_response["final_response"] else f"⚠️ Pas de réponse de {agent_name}"
@@ -719,21 +723,18 @@ def extract_text_from_multiple_files(uploaded_files, ocr):
 
 # FONCTION D'OPTIMISATION DU PROMPT POUR ROUTEUR
 def optimize_prompt_for_router(original_prompt: str) -> str:
-    """Optimise le prompt pour déclencher l'orchestration multi-agent"""
-    # Mots-clés qui déclenchent l'orchestration
-    orchestration_triggers = [
-        "analyze", "compare", "evaluate", "review", "draft", "negotiate", 
-        "search", "quality", "management", "contract", "multiple", "comprehensive"
-    ]
-    
-    # Vérifier si le prompt contient déjà des déclencheurs
-    has_triggers = any(trigger in original_prompt.lower() for trigger in orchestration_triggers)
-    
-    if not has_triggers:
-        # Ajouter un contexte d'orchestration
-        return f"Please orchestrate with your collaborator agents to comprehensively address this request: {original_prompt}"
-    
-    return original_prompt
+    """Optimise le prompt pour forcer l'exécution multi-agent"""
+    # Prompt optimisé pour forcer l'exécution réelle
+    return f"""EXECUTE IMMEDIATELY - Do not plan or describe, but actually invoke your collaborator agents now.
+
+Task: {original_prompt}
+
+You must:
+1. Actually call your collaborator agents (not just plan to call them)
+2. Wait for their real responses
+3. Provide a consolidated answer based on their actual outputs
+
+Do not simulate or describe what you would do - execute the collaboration now."""
 
 def prompt_constructor(user_input, ocr):
     """Construit le prompt avec gestion des fichiers"""
