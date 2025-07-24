@@ -40,7 +40,7 @@ try:
     REGION_NAME = st.secrets["aws"]["region"]
 
 except Exception as e:
-    # Valeurs par défaut si secrets non configurés (pour éviter les erreurs au démarrage)
+    # Valeurs par défaut si secrets non configurés
     st.error("Configuration des secrets manquante. Veuillez configurer les secrets dans Streamlit Cloud.")
     AGENT_IDS = {}
     AGENT_ALIAS_IDS = {}
@@ -102,7 +102,7 @@ def validate_agent_configuration():
     else:
         return True
 
-# Fonction de test de connexion pour l'agent routeur - VERSION CORRIGÉE
+# Fonction de test de connexion pour l'agent routeur
 async def test_router_connection():
     """Teste la connexion à l'agent routeur et sa capacité de collaboration"""
     try:
@@ -124,8 +124,9 @@ async def test_router_connection():
             enableTrace=True  # Important pour voir les traces de collaboration
         )
 
-        # Extraire la réponse
+        # Extraire la réponse en gérant les traces multi-agent
         full_response = ""
+        
         for event in response["completion"]:
             if "chunk" in event:
                 chunk = event["chunk"]
@@ -152,11 +153,74 @@ async def test_router_connection():
             "solution": "Vérifiez que l'agent routeur est configuré avec 'Multi-agent collaboration' activé dans Bedrock."
         }
 
-# FONCTION PRINCIPALE CORRIGÉE - TRAITEMENT IDENTIQUE POUR TOUS LES AGENTS
+# FONCTION CORRIGÉE pour parser les traces multi-agent
+def parse_multi_agent_traces(response):
+    """
+    Parse les traces de collaboration multi-agent pour extraire les vraies réponses
+    """
+    collaborator_responses = []
+    final_response = ""
+    trace_info = []
+    
+    for event in response.get("completion", []):
+        # Traiter les traces (contiennent les réponses des agents collaborateurs)
+        if "trace" in event:
+            trace = event["trace"]
+            if "trace" in trace:
+                trace_data = trace["trace"]
+                
+                # Vérifier les traces d'orchestration
+                if "orchestrationTrace" in trace_data:
+                    orch_trace = trace_data["orchestrationTrace"]
+                    
+                    # Chercher les observations (réponses des agents collaborateurs)
+                    if "observation" in orch_trace:
+                        observation = orch_trace["observation"]
+                        
+                        # Si c'est une réponse d'agent collaborateur
+                        if observation.get("type") == "AGENT_COLLABORATOR" and "agentCollaboratorInvocationOutput" in observation:
+                            collab_output = observation["agentCollaboratorInvocationOutput"]
+                            collab_name = collab_output.get("agentCollaboratorName", "Unknown")
+                            
+                            # Extraire la vraie réponse de l'agent collaborateur
+                            if "output" in collab_output and "text" in collab_output["output"]:
+                                response_text = collab_output["output"]["text"]
+                                collaborator_responses.append({
+                                    "agent": collab_name,
+                                    "response": response_text
+                                })
+                                trace_info.append(f"✅ Réponse de {collab_name}: {response_text[:100]}...")
+                        
+                        # Si c'est la réponse finale
+                        elif observation.get("type") == "FINISH" and "finalResponse" in observation:
+                            if "text" in observation["finalResponse"]:
+                                final_response = observation["finalResponse"]["text"]
+        
+        # Traiter les chunks (réponse finale consolidée)
+        elif "chunk" in event:
+            chunk = event["chunk"]
+            if "bytes" in chunk:
+                try:
+                    chunk_data = json.loads(chunk["bytes"].decode('utf-8'))
+                    if "text" in chunk_data:
+                        final_response += chunk_data["text"]
+                except json.JSONDecodeError:
+                    chunk_text = chunk["bytes"].decode('utf-8')
+                    if chunk_text.strip():
+                        final_response += chunk_text
+            elif "text" in chunk:
+                final_response += chunk["text"]
+    
+    return {
+        "collaborator_responses": collaborator_responses,
+        "final_response": final_response.strip(),
+        "trace_info": trace_info
+    }
+
+# FONCTION PRINCIPALE CORRIGÉE pour gérer multi-agent collaboration
 async def execute_agent(agent_key, agent_info, message_content):
     """
-    Exécute un agent spécifique avec Bedrock - TRAITEMENT UNIFORME
-    Le routeur gère automatiquement sa collaboration multi-agent
+    Exécute un agent spécifique avec Bedrock - Gestion spéciale pour multi-agent
     """
     max_retries = 3
     retry_delay = 2
@@ -177,32 +241,60 @@ async def execute_agent(agent_key, agent_info, message_content):
             if attempt > 0:
                 time.sleep(retry_delay * attempt)
             
-            # TRAITEMENT IDENTIQUE POUR TOUS LES AGENTS
-            # Le routeur gère automatiquement la collaboration multi-agent
+            # Invoquer l'agent avec traces activées
             response = client.invoke_agent(
                 agentId=AGENT_IDS[agent_key],
                 agentAliasId=AGENT_ALIAS_IDS[agent_key],
                 sessionId=current_session_id,
                 inputText=message_content,
-                enableTrace=True  # Activer les traces pour voir la collaboration
+                enableTrace=True  # CRITIQUE pour multi-agent collaboration
             )
 
-            # Extraire la réponse du streaming
-            full_response = ""
-            for event in response["completion"]:
-                if "chunk" in event:
-                    chunk = event["chunk"]
-                    if "bytes" in chunk:
-                        try:
-                            chunk_data = json.loads(chunk["bytes"].decode('utf-8'))
-                            if "text" in chunk_data:
-                                full_response += chunk_data["text"]
-                        except json.JSONDecodeError:
-                            full_response += chunk["bytes"].decode('utf-8')
-                    elif "text" in chunk:
-                        full_response += chunk["text"]
+            # Si c'est l'agent routeur, parser spécialement les traces multi-agent
+            if agent_key == "router":
+                parsed_response = parse_multi_agent_traces(response)
+                
+                # Debug info si activé
+                if st.session_state.debug_mode:
+                    if parsed_response["trace_info"]:
+                        st.info("🔍 Traces de collaboration multi-agent:")
+                        for trace in parsed_response["trace_info"]:
+                            st.write(f"  - {trace}")
+                
+                # Construire la réponse finale
+                if parsed_response["collaborator_responses"]:
+                    # S'il y a des réponses d'agents collaborateurs
+                    responses_text = []
+                    for collab in parsed_response["collaborator_responses"]:
+                        responses_text.append(f"**{collab['agent']}**:\n{collab['response']}")
+                    
+                    # Si pas de réponse finale consolidée, utiliser les réponses des collaborateurs
+                    if not parsed_response["final_response"]:
+                        return "\n\n".join(responses_text)
+                    else:
+                        # Sinon retourner la réponse finale consolidée
+                        return parsed_response["final_response"]
+                else:
+                    # Si pas de réponses de collaborateurs, retourner la réponse finale
+                    return parsed_response["final_response"] if parsed_response["final_response"] else f"Pas de réponse de {agent_name}"
+            
+            else:
+                # Pour les autres agents (non-routeur), traitement standard
+                full_response = ""
+                for event in response["completion"]:
+                    if "chunk" in event:
+                        chunk = event["chunk"]
+                        if "bytes" in chunk:
+                            try:
+                                chunk_data = json.loads(chunk["bytes"].decode('utf-8'))
+                                if "text" in chunk_data:
+                                    full_response += chunk_data["text"]
+                            except json.JSONDecodeError:
+                                full_response += chunk["bytes"].decode('utf-8')
+                        elif "text" in chunk:
+                            full_response += chunk["text"]
 
-            return full_response.strip() if full_response.strip() else f"Pas de réponse de {agent_name}"
+                return full_response.strip() if full_response.strip() else f"Pas de réponse de {agent_name}"
 
         except Exception as e:
             if "throttling" in str(e).lower() and attempt < max_retries - 1:
