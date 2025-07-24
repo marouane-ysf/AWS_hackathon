@@ -71,11 +71,15 @@ AGENTS = {
 def get_bedrock_client():
     """Initialise et retourne le client Bedrock avec credentials explicites"""
     try:
-        # Configuration pour gérer les timeouts longs et le streaming
+        # Configuration optimisée pour multi-agent collaboration
         config = Config(
-            read_timeout=3600,  # 1 heure pour les réponses longues
-            connect_timeout=60,
-            retries={'mode': 'standard', 'max_attempts': 3}
+            read_timeout=7200,  # 2 heures pour orchestrations complexes
+            connect_timeout=120,
+            retries={'mode': 'adaptive', 'max_attempts': 5},
+            max_pool_connections=50,
+            # Paramètres spécifiques pour Bedrock
+            parameter_validation=False,  # Éviter les validations strictes
+            signature_version='v4'  # Version de signature AWS
         )
         
         # Créer le client avec les credentials depuis st.secrets
@@ -93,218 +97,305 @@ def get_bedrock_client():
 def get_or_create_session_id():
     """Génère un session ID unique pour maintenir la cohérence"""
     if "bedrock_session_id" not in st.session_state:
-        st.session_state.bedrock_session_id = f"{SESSION_ID}-{uuid.uuid4().hex[:8]}"
+        # Session ID plus spécifique pour éviter les conflits
+        timestamp = int(time.time())
+        st.session_state.bedrock_session_id = f"streamlit-{timestamp}-{uuid.uuid4().hex[:12]}"
     return st.session_state.bedrock_session_id
 
+# FONCTION DE DIAGNOSTIC MULTI-AGENT
+async def diagnose_router_agent():
+    """Diagnostique l'agent routeur et sa configuration multi-agent"""
+    try:
+        client = get_bedrock_client()
+        if not client:
+            return {"error": "Client Bedrock non disponible"}
+        
+        session_id = get_or_create_session_id()
+        
+        # Test simple d'orchestration
+        test_query = "Please orchestrate with your collaborator agents to provide a brief overview of contract management best practices. This should involve multiple agents working together."
+        
+        response = client.invoke_agent(
+            agentId=AGENT_IDS["router"],
+            agentAliasId=AGENT_ALIAS_IDS["router"],
+            sessionId=session_id,
+            inputText=test_query,
+            enableTrace=True,
+            endSession=False
+        )
+        
+        parsed = parse_multi_agent_response_complete(response)
+        
+        # Analyser les résultats
+        diagnosis = {
+            "router_responsive": bool(parsed["final_response"]),
+            "collaboration_detected": bool(parsed["collaborator_responses"]),
+            "orchestration_steps": len(parsed["orchestration_steps"]),
+            "collaborators_count": len(parsed["collaborator_responses"]),
+            "errors": parsed["errors"],
+            "raw_response_length": len(parsed["final_response"]),
+            "recommendation": ""
+        }
+        
+        # Générer des recommandations
+        if not diagnosis["collaboration_detected"]:
+            diagnosis["recommendation"] = "L'agent routeur ne collabore pas avec d'autres agents. Vérifiez la configuration 'Multi-agent collaboration' dans AWS Bedrock."
+        elif diagnosis["collaborators_count"] < 2:
+            diagnosis["recommendation"] = "Collaboration limitée détectée. Vérifiez que tous les agents collaborateurs sont correctement configurés."
+        else:
+            diagnosis["recommendation"] = "Configuration multi-agent semble correcte."
+        
+        return diagnosis
+        
+    except Exception as e:
+        return {"error": f"Erreur de diagnostic: {str(e)}"}
+
 def validate_agent_configuration():
-    """Valide que tous les agents ont leurs IDs configurés"""
-    missing_agents = []
-    for agent_key in AGENTS.keys():
-        if agent_key not in AGENT_IDS or not AGENT_IDS[agent_key] or agent_key not in AGENT_ALIAS_IDS or not AGENT_ALIAS_IDS[agent_key]:
-            missing_agents.append(agent_key)
+    """Validation complète de la configuration des agents"""
+    config_status = validate_multi_agent_setup()
     
-    if missing_agents:
-        st.error(f"❌ Agents manquants dans la configuration: {missing_agents}")
-        st.error("Vérifiez votre configuration des secrets")
+    if not config_status["valid"]:
+        st.error(f"❌ Configuration invalide: {len(config_status['issues'])} problèmes détectés")
+        for issue in config_status["issues"]:
+            st.error(f"  • {issue}")
+        st.info(f"Agents configurés: {config_status['configured_agents']}/{config_status['total_agents']}")
         return False
     else:
+        st.success(f"✅ Configuration valide: {config_status['total_agents']} agents configurés")
         return True
 
-# Fonction de test de connexion pour l'agent routeur
+# FONCTION DE TEST AMÉLIORÉE
 async def test_router_connection():
-    """Teste la connexion à l'agent routeur et sa capacité de collaboration"""
+    """Test complet de l'agent routeur et de sa capacité d'orchestration"""
     try:
         client = get_bedrock_client()
         if not client:
             return {
                 "success": False,
-                "error": "Impossible d'initialiser le client Bedrock",
-                "solution": "Vérifiez vos credentials AWS dans les secrets Streamlit"
+                "error": "Client Bedrock indisponible",
+                "solution": "Vérifiez les credentials AWS"
             }
-            
-        current_session_id = get_or_create_session_id()
+        
+        # Validation de la configuration
+        config_check = validate_multi_agent_setup()
+        if not config_check["valid"]:
+            return {
+                "success": False,
+                "error": f"Configuration invalide: {', '.join(config_check['issues'])}",
+                "solution": "Corrigez la configuration des agents"
+            }
+        
+        session_id = get_or_create_session_id()
+        
+        # Test d'orchestration réel
+        test_prompt = "Please orchestrate with your collaborator agents to analyze contract management best practices. This requires multi-agent collaboration."
         
         response = client.invoke_agent(
             agentId=AGENT_IDS["router"],
             agentAliasId=AGENT_ALIAS_IDS["router"],
-            sessionId=current_session_id,
-            inputText="Test simple: Please respond that you are operational and ready for multi-agent collaboration.",
-            enableTrace=True  # Important pour voir les traces de collaboration
+            sessionId=session_id,
+            inputText=test_prompt,
+            enableTrace=True,
+            endSession=False
         )
-
-        # Parser la réponse avec la nouvelle méthode
-        parsed_response = parse_multi_agent_response_complete(response)
+        
+        parsed = parse_multi_agent_response_complete(response)
+        
+        # Évaluation des résultats
+        collaboration_detected = bool(parsed["collaborator_responses"]) or any(
+            "agent" in step.get("type", "") for step in parsed["orchestration_steps"]
+        )
         
         return {
             "success": True,
-            "response": parsed_response["final_response"],
-            "note": "Agent routeur opérationnel. La collaboration multi-agent se fait automatiquement."
+            "response": parsed["final_response"][:300] + "..." if len(parsed["final_response"]) > 300 else parsed["final_response"],
+            "collaboration_detected": collaboration_detected,
+            "collaborators_count": len(parsed["collaborator_responses"]),
+            "orchestration_steps": len(parsed["orchestration_steps"]),
+            "note": "Test d'orchestration multi-agent réussi" if collaboration_detected else "Aucune collaboration détectée - vérifiez la configuration Bedrock"
         }
-
+        
     except Exception as e:
         return {
             "success": False,
-            "error": str(e),
-            "solution": "Vérifiez que l'agent routeur est configuré avec 'Multi-agent collaboration' activé dans Bedrock."
+            "error": str(e)[:200],
+            "solution": "Vérifiez la configuration de l'agent routeur dans AWS Bedrock"
         }
 
-# NOUVELLE FONCTION COMPLÈTE pour parser les réponses multi-agent
+# PARSER MULTI-AGENT OPTIMISÉ
 def parse_multi_agent_response_complete(response: Dict) -> Dict:
     """
-    Parse complète des réponses multi-agent basée sur les patterns AWS officiels
-    Gère les traces, les réponses des collaborateurs et les erreurs RerunData
+    Parser optimisé pour les réponses multi-agent AWS Bedrock
+    Gère correctement le streaming et l'orchestration
     """
     result = {
         "final_response": "",
         "collaborator_responses": {},
         "orchestration_steps": [],
         "trace_info": [],
-        "errors": []
+        "errors": [],
+        "raw_chunks": []  # Pour debug
     }
     
     try:
-        # Parcourir tous les événements dans la réponse
-        for event in response.get("completion", []):
-            
-            # 1. Traiter les chunks (réponse finale)
-            if "chunk" in event and event["chunk"]:
+        # Traitement des événements de streaming
+        event_stream = response.get("completion", [])
+        
+        for event in event_stream:
+            # 1. CHUNKS - Réponse finale streamée
+            if "chunk" in event:
                 chunk = event["chunk"]
                 if "bytes" in chunk:
-                    decoded_bytes = chunk["bytes"].decode('utf-8')
-                    
-                    # Filtrer les erreurs RerunData
-                    if "RerunData" in decoded_bytes:
-                        result["errors"].append("RerunData error detected and filtered")
-                        continue
-                    
-                    # Essayer de parser comme JSON d'abord
                     try:
-                        chunk_data = json.loads(decoded_bytes)
-                        if "text" in chunk_data:
-                            result["final_response"] += chunk_data["text"]
-                    except json.JSONDecodeError:
-                        # Si ce n'est pas du JSON, ajouter tel quel
-                        if decoded_bytes.strip():
-                            result["final_response"] += decoded_bytes
+                        decoded = chunk["bytes"].decode('utf-8')
+                        result["raw_chunks"].append(decoded)
+                        
+                        # Filtrer les erreurs système
+                        if any(error in decoded for error in ["RerunData", "InternalServerError", "ValidationException"]):
+                            result["errors"].append(f"Erreur système filtrée: {decoded[:100]}")
+                            continue
+                        
+                        # Essayer JSON puis texte brut
+                        try:
+                            chunk_json = json.loads(decoded)
+                            if "text" in chunk_json:
+                                result["final_response"] += chunk_json["text"]
+                            elif "content" in chunk_json:
+                                result["final_response"] += chunk_json["content"]
+                        except json.JSONDecodeError:
+                            if decoded.strip() and not decoded.startswith("{"):
+                                result["final_response"] += decoded
+                                
+                    except UnicodeDecodeError as e:
+                        result["errors"].append(f"Erreur décodage: {str(e)}")
             
-            # 2. Traiter les traces (contiennent les réponses des collaborateurs)
+            # 2. TRACES - Orchestration multi-agent
             elif "trace" in event:
-                trace_part = event["trace"]
+                trace_event = event["trace"]
                 
-                # Extraire les informations du collaborateur
-                collaborator_name = trace_part.get("collaboratorName")
-                caller_chain = trace_part.get("callerChain", [])
+                # Informations du collaborateur
+                collab_name = trace_event.get("collaboratorName")
+                if collab_name:
+                    result["trace_info"].append(f"Collaborateur: {collab_name}")
                 
-                # Si on a un nom de collaborateur, l'ajouter aux infos
-                if collaborator_name:
-                    result["trace_info"].append(f"Trace from: {collaborator_name}")
-                
-                # Parser le contenu de la trace
-                if "trace" in trace_part:
-                    trace_content = trace_part["trace"]
+                # Contenu de la trace
+                if "trace" in trace_event:
+                    trace_data = trace_event["trace"]
                     
-                    # Traiter les traces de pré-processing
-                    if "preProcessingTrace" in trace_content:
-                        pre_trace = trace_content["preProcessingTrace"]
-                        if "modelInvocationInput" in pre_trace:
-                            input_text = pre_trace["modelInvocationInput"].get("text", "")
-                            result["orchestration_steps"].append({
-                                "type": "pre_processing",
-                                "input": input_text[:200] + "..." if len(input_text) > 200 else input_text
-                            })
-                    
-                    # Traiter les traces d'orchestration (CRITIQUE pour multi-agent)
-                    if "orchestrationTrace" in trace_content:
-                        orch_trace = trace_content["orchestrationTrace"]
+                    # ORCHESTRATION TRACE - Le plus important
+                    if "orchestrationTrace" in trace_data:
+                        orch = trace_data["orchestrationTrace"]
                         
-                        # Extraire le raisonnement
-                        if "modelInvocationInput" in orch_trace:
-                            reasoning = orch_trace["modelInvocationInput"].get("text", "")
-                            result["orchestration_steps"].append({
-                                "type": "orchestration",
-                                "reasoning": reasoning[:300] + "..." if len(reasoning) > 300 else reasoning
-                            })
+                        # Raisonnement du routeur
+                        if "modelInvocationInput" in orch:
+                            reasoning = orch["modelInvocationInput"].get("text", "")
+                            if reasoning:
+                                result["orchestration_steps"].append({
+                                    "type": "reasoning",
+                                    "content": reasoning
+                                })
                         
-                        # EXTRAIRE LES RÉPONSES DES AGENTS COLLABORATEURS
-                        if "observation" in orch_trace:
-                            observation = orch_trace["observation"]
-                            obs_type = observation.get("type", "")
+                        # Observations - Réponses des collaborateurs
+                        if "observation" in orch:
+                            obs = orch["observation"]
+                            obs_type = obs.get("type")
                             
-                            # Si c'est une réponse d'agent collaborateur
-                            if obs_type == "AGENT_COLLABORATOR" and "agentCollaboratorInvocationOutput" in observation:
-                                collab_output = observation["agentCollaboratorInvocationOutput"]
-                                
-                                # Extraire le nom et la réponse du collaborateur
-                                collab_name = collab_output.get("agentCollaboratorName", "Unknown")
-                                collab_alias = collab_output.get("agentCollaboratorAliasArn", "")
-                                
-                                # Extraire la réponse textuelle
-                                if "output" in collab_output:
-                                    output_text = collab_output["output"].get("text", "")
+                            # AGENT COLLABORATOR - Réponse d'un agent
+                            if obs_type == "AGENT_COLLABORATOR":
+                                if "agentCollaboratorInvocationOutput" in obs:
+                                    collab_out = obs["agentCollaboratorInvocationOutput"]
+                                    agent_name = collab_out.get("agentCollaboratorName", "Agent")
                                     
-                                    # Stocker la réponse du collaborateur
-                                    result["collaborator_responses"][collab_name] = {
-                                        "response": output_text,
-                                        "alias": collab_alias
-                                    }
-                                    
-                                    # Ajouter à l'orchestration
+                                    if "output" in collab_out and "text" in collab_out["output"]:
+                                        agent_response = collab_out["output"]["text"]
+                                        
+                                        # Stocker la réponse
+                                        result["collaborator_responses"][agent_name] = {
+                                            "response": agent_response,
+                                            "type": "collaborator"
+                                        }
+                                        
+                                        result["orchestration_steps"].append({
+                                            "type": "agent_response",
+                                            "agent": agent_name,
+                                            "preview": agent_response[:150] + "..." if len(agent_response) > 150 else agent_response
+                                        })
+                            
+                            # FINISH - Réponse finale
+                            elif obs_type == "FINISH":
+                                if "finalResponse" in obs and "text" in obs["finalResponse"]:
+                                    final_text = obs["finalResponse"]["text"]
+                                    if final_text and len(final_text.strip()) > 0:
+                                        # Priorité à la réponse finale de l'orchestration
+                                        if not result["final_response"] or len(result["final_response"]) < len(final_text):
+                                            result["final_response"] = final_text
+                            
+                            # ACTION GROUP
+                            elif obs_type == "ACTION_GROUP":
+                                if "actionGroupInvocationOutput" in obs:
+                                    action_out = obs["actionGroupInvocationOutput"]
+                                    action_text = action_out.get("text", "")
                                     result["orchestration_steps"].append({
-                                        "type": "collaborator_response",
-                                        "agent": collab_name,
-                                        "response_preview": output_text[:200] + "..." if len(output_text) > 200 else output_text
+                                        "type": "action",
+                                        "content": action_text[:100] + "..." if len(action_text) > 100 else action_text
                                     })
                             
-                            # Si c'est une action group
-                            elif obs_type == "ACTION_GROUP" and "actionGroupInvocationOutput" in observation:
-                                action_output = observation["actionGroupInvocationOutput"]
-                                action_text = action_output.get("text", "")
-                                result["orchestration_steps"].append({
-                                    "type": "action_group",
-                                    "output": action_text[:200] + "..." if len(action_text) > 200 else action_text
-                                })
-                            
-                            # Si c'est une recherche knowledge base
-                            elif obs_type == "KNOWLEDGE_BASE" and "knowledgeBaseLookupOutput" in observation:
-                                kb_output = observation["knowledgeBaseLookupOutput"]
-                                references = kb_output.get("retrievedReferences", [])
-                                result["orchestration_steps"].append({
-                                    "type": "knowledge_base",
-                                    "references_count": len(references)
-                                })
-                            
-                            # Si c'est la réponse finale
-                            elif obs_type == "FINISH" and "finalResponse" in observation:
-                                final_text = observation["finalResponse"].get("text", "")
-                                if final_text and not result["final_response"]:
-                                    result["final_response"] = final_text
+                            # KNOWLEDGE BASE
+                            elif obs_type == "KNOWLEDGE_BASE":
+                                if "knowledgeBaseLookupOutput" in obs:
+                                    kb_out = obs["knowledgeBaseLookupOutput"]
+                                    refs = kb_out.get("retrievedReferences", [])
+                                    result["orchestration_steps"].append({
+                                        "type": "knowledge_search",
+                                        "references_count": len(refs)
+                                    })
                     
-                    # Traiter les traces post-processing
-                    if "postProcessingTrace" in trace_content:
-                        post_trace = trace_content["postProcessingTrace"]
-                        if "modelInvocationOutput" in post_trace:
-                            parsed_response = post_trace["modelInvocationOutput"].get("parsedResponse", {})
-                            result["orchestration_steps"].append({
-                                "type": "post_processing",
-                                "output": str(parsed_response)[:200] + "..." if len(str(parsed_response)) > 200 else str(parsed_response)
-                            })
+                    # PRE/POST PROCESSING
+                    for trace_type in ["preProcessingTrace", "postProcessingTrace"]:
+                        if trace_type in trace_data:
+                            trace_content = trace_data[trace_type]
+                            if "modelInvocationInput" in trace_content:
+                                input_text = trace_content["modelInvocationInput"].get("text", "")
+                                if input_text:
+                                    result["orchestration_steps"].append({
+                                        "type": trace_type.replace("Trace", "").lower(),
+                                        "content": input_text[:100] + "..." if len(input_text) > 100 else input_text
+                                    })
     
     except Exception as e:
-        result["errors"].append(f"Erreur lors du parsing: {str(e)}")
-        st.error(f"Erreur de parsing des traces: {e}")
+        result["errors"].append(f"Erreur parsing: {str(e)}")
+        # En mode debug seulement
+        if hasattr(st.session_state, 'debug_mode') and st.session_state.debug_mode:
+            st.error(f"Erreur de parsing: {e}")
     
-    # Si pas de réponse finale mais des réponses de collaborateurs, les consolider
-    if not result["final_response"] and result["collaborator_responses"]:
-        consolidated = []
+    # POST-TRAITEMENT
+    # 1. Si pas de réponse finale, consolider les collaborateurs
+    if not result["final_response"].strip() and result["collaborator_responses"]:
+        sections = []
         for agent_name, agent_data in result["collaborator_responses"].items():
+            # Trouver l'icône de l'agent
             agent_icon = "🤖"
-            # Trouver l'icône correspondante
             for key, info in AGENTS.items():
-                if agent_name.lower() in info["name"].lower() or key in agent_name.lower():
+                if any(keyword in agent_name.lower() for keyword in [key, info["name"].lower().split()[0]]):
                     agent_icon = info["icon"]
                     break
-            consolidated.append(f"{agent_icon} **{agent_name}**:\n{agent_data['response']}")
-        result["final_response"] = "\n\n".join(consolidated)
+            
+            sections.append(f"{agent_icon} **{agent_name}**\n{agent_data['response']}")
+        
+        if sections:
+            result["final_response"] = "\n\n".join(sections)
+    
+    # 2. Nettoyer la réponse finale
+    if result["final_response"]:
+        # Supprimer les doublons et nettoyer
+        result["final_response"] = result["final_response"].strip()
+        # Supprimer les répétitions de phrases
+        lines = result["final_response"].split('\n')
+        unique_lines = []
+        for line in lines:
+            if line.strip() and line not in unique_lines:
+                unique_lines.append(line)
+        result["final_response"] = '\n'.join(unique_lines)
     
     return result
 
@@ -332,15 +423,25 @@ async def execute_agent(agent_key, agent_info, message_content):
             if attempt > 0:
                 time.sleep(retry_delay * attempt)
             
-            # Invoquer l'agent avec traces activées
-            response = client.invoke_agent(
-                agentId=AGENT_IDS[agent_key],
-                agentAliasId=AGENT_ALIAS_IDS[agent_key],
-                sessionId=current_session_id,
-                inputText=message_content,
-                enableTrace=True,  # CRITIQUE pour multi-agent collaboration
-                endSession=False   # Garder la session ouverte
-            )
+            # Invoquer l'agent avec configuration optimisée
+            invoke_params = {
+                "agentId": AGENT_IDS[agent_key],
+                "agentAliasId": AGENT_ALIAS_IDS[agent_key],
+                "sessionId": current_session_id,
+                "inputText": message_content,
+                "enableTrace": True,
+                "endSession": False
+            }
+            
+            # Pour l'agent routeur, ajouter des paramètres spécifiques
+            if agent_key == "router":
+                # S'assurer que l'orchestration est activée
+                invoke_params["enableTrace"] = True
+                # Ajouter un contexte pour l'orchestration
+                if "Orchestrate" not in message_content and "collaborate" not in message_content.lower():
+                    invoke_params["inputText"] = f"Please orchestrate and collaborate with appropriate agents to handle this request: {message_content}"
+            
+            response = client.invoke_agent(**invoke_params)
 
             # Utiliser le nouveau parser complet
             parsed_response = parse_multi_agent_response_complete(response)
@@ -364,51 +465,73 @@ async def execute_agent(agent_key, agent_info, message_content):
                 if parsed_response["errors"]:
                     st.warning(f"⚠️ Erreurs filtrées: {', '.join(parsed_response['errors'])}")
             
-            # Si c'est l'agent routeur, formater spécialement la réponse
-            if agent_key == "router" and parsed_response["collaborator_responses"]:
-                # Créer une belle réponse consolidée
-                sections = []
+            # Traitement spécial pour l'agent routeur
+            if agent_key == "router":
+                # Vérifier si l'orchestration a bien eu lieu
+                has_collaboration = bool(parsed_response["collaborator_responses"]) or any(
+                    step["type"] in ["agent_response", "collaborator_response"] 
+                    for step in parsed_response["orchestration_steps"]
+                )
                 
-                # Ajouter un résumé si disponible
-                if parsed_response["final_response"]:
-                    sections.append("## 📊 Synthèse de l'orchestration\n" + parsed_response["final_response"])
-                
-                # Ajouter les réponses des collaborateurs
-                if parsed_response["collaborator_responses"]:
-                    sections.append("\n## 🤝 Réponses des agents collaborateurs")
-                    for agent_name, agent_data in parsed_response["collaborator_responses"].items():
-                        # Trouver l'icône de l'agent
-                        agent_icon = "🤖"
-                        for key, info in AGENTS.items():
-                            if agent_name.lower() in info["name"].lower() or key in agent_name.lower():
-                                agent_icon = info["icon"]
-                                break
-                        
-                        sections.append(f"\n### {agent_icon} {agent_name}\n{agent_data['response']}")
-                
-                return "\n".join(sections)
+                if has_collaboration:
+                    # Orchestration réussie - formater la réponse
+                    sections = []
+                    
+                    if parsed_response["final_response"]:
+                        sections.append(f"🎯 **Orchestration Multi-Agent Complétée**\n\n{parsed_response['final_response']}")
+                    
+                    if parsed_response["collaborator_responses"]:
+                        sections.append("\n---\n🤝 **Détails des Collaborateurs:**")
+                        for agent_name, agent_data in parsed_response["collaborator_responses"].items():
+                            agent_icon = "🤖"
+                            for key, info in AGENTS.items():
+                                if any(keyword in agent_name.lower() for keyword in [key, info["name"].lower().split()[0]]):
+                                    agent_icon = info["icon"]
+                                    break
+                            sections.append(f"\n{agent_icon} **{agent_name}:**\n{agent_data['response']}")
+                    
+                    return "\n".join(sections)
+                else:
+                    # Pas de collaboration détectée - retourner la réponse directe
+                    if parsed_response["final_response"]:
+                        return f"🎯 **Agent Routeur (Réponse Directe):**\n\n{parsed_response['final_response']}"
+                    else:
+                        return f"⚠️ L'agent routeur n'a pas généré de réponse. Vérifiez la configuration multi-agent."
             else:
-                # Pour les autres agents, retourner simplement la réponse finale
-                return parsed_response["final_response"] if parsed_response["final_response"] else f"Pas de réponse de {agent_name}"
+                # Autres agents - réponse standard
+                return parsed_response["final_response"] if parsed_response["final_response"] else f"⚠️ Pas de réponse de {agent_name}"
 
         except Exception as e:
             error_str = str(e).lower()
             
-            # Gestion spécifique du throttling
-            if "throttling" in error_str and attempt < max_retries - 1:
-                wait_time = retry_delay * (attempt + 1)
-                st.warning(f"⏳ Limite de débit atteinte. Nouvelle tentative dans {wait_time} secondes...")
-                await asyncio.sleep(wait_time)
-                continue
+            # Gestion spécifique des erreurs
+            if "throttling" in error_str or "rate" in error_str:
+                if attempt < max_retries - 1:
+                    wait_time = retry_delay * (2 ** attempt)  # Backoff exponentiel
+                    st.warning(f"⏳ Limite de débit. Attente {wait_time}s...")
+                    await asyncio.sleep(wait_time)
+                    continue
+                else:
+                    return f"❌ Limite de débit dépassée pour {agent_name}. Réessayez plus tard."
             
-            # Gestion des autres erreurs communes
-            elif "accessdenied" in error_str:
-                return f"❌ Accès refusé pour {agent_name}. Vérifiez les permissions IAM."
-            elif "resourcenotfound" in error_str:
-                return f"❌ Agent {agent_name} non trouvé. Vérifiez l'ID et l'alias."
+            elif "accessdenied" in error_str or "forbidden" in error_str:
+                return f"❌ Accès refusé pour {agent_name}. Vérifiez les permissions IAM et la configuration de l'agent."
+            
+            elif "resourcenotfound" in error_str or "notfound" in error_str:
+                return f"❌ Agent {agent_name} introuvable. Vérifiez l'ID ({AGENT_IDS.get(agent_key, 'N/A')}) et l'alias ({AGENT_ALIAS_IDS.get(agent_key, 'N/A')})."
+            
+            elif "timeout" in error_str:
+                if attempt < max_retries - 1:
+                    st.warning(f"⏱️ Timeout pour {agent_name}. Nouvelle tentative...")
+                    await asyncio.sleep(retry_delay)
+                    continue
+                else:
+                    return f"❌ Timeout pour {agent_name}. L'orchestration peut prendre plus de temps que prévu."
+            
             else:
-                error_msg = f"❌ Erreur lors de l'exécution de {agent_info['name']}: {e}"
-                st.error(error_msg)
+                error_msg = f"❌ Erreur {agent_name}: {str(e)[:200]}"
+                if attempt == max_retries - 1:  # Dernière tentative
+                    st.error(error_msg)
                 return error_msg
 
 # Fonction pour exécuter un pipeline séquentiel
@@ -482,17 +605,23 @@ async def run_specific_agent(query, agent_key):
 # FONCTION PRINCIPALE SIMPLIFIÉE
 async def run_workflow_based_on_mode(query, mode):
     """
-    Version complète avec support multi-agent avancé
+    Workflow optimisé avec support multi-agent avancé
     """
     if mode == "intelligent":
-        st.session_state.progress_text = f"🎯 Agent Routeur: Orchestration multi-agent en cours..."
+        st.session_state.progress_text = f"🎯 Agent Routeur: Lancement de l'orchestration..."
         
-        # Le router gère automatiquement ses collaborateurs
-        response = await run_specific_agent(query, "router")
+        # Optimiser le prompt pour l'orchestration
+        optimized_query = optimize_prompt_for_router(query)
         
-        # Ajouter des informations spécifiques au routeur
-        response["selection_method"] = "Orchestration Multi-Agent Automatique"
-        response["router_response"] = "Orchestration complète avec collaboration multi-agent"
+        # Exécuter l'agent routeur avec le prompt optimisé
+        response = await run_specific_agent(optimized_query, "router")
+        
+        # Enrichir la réponse avec des métadonnées
+        response["selection_method"] = "Orchestration Multi-Agent Intelligente"
+        response["original_query"] = query
+        response["optimized_query"] = optimized_query
+        response["mode"] = "intelligent_router"
+        
         return response
         
     elif mode == "sequence":
@@ -505,12 +634,19 @@ async def run_workflow_based_on_mode(query, mode):
 
 # Fonction pour exécuter les fonctions asynchrones dans Streamlit
 def run_async_function(func, *args, **kwargs):
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+    """Exécute une fonction asynchrone dans Streamlit avec gestion d'erreur améliorée"""
     try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
         return loop.run_until_complete(func(*args, **kwargs))
+    except Exception as e:
+        st.error(f"Erreur d'exécution asynchrone: {str(e)}")
+        return {"error": f"Erreur d'exécution: {str(e)}"}
     finally:
-        loop.close()
+        try:
+            loop.close()
+        except:
+            pass
 
 # Fonctions pour extraction de texte PDF MODIFIÉES
 def extract_text_from_pdf_ocr(pdf_document):
@@ -581,6 +717,24 @@ def extract_text_from_multiple_files(uploaded_files, ocr):
     progress_bar.progress(1.0)
     return files_text
 
+# FONCTION D'OPTIMISATION DU PROMPT POUR ROUTEUR
+def optimize_prompt_for_router(original_prompt: str) -> str:
+    """Optimise le prompt pour déclencher l'orchestration multi-agent"""
+    # Mots-clés qui déclenchent l'orchestration
+    orchestration_triggers = [
+        "analyze", "compare", "evaluate", "review", "draft", "negotiate", 
+        "search", "quality", "management", "contract", "multiple", "comprehensive"
+    ]
+    
+    # Vérifier si le prompt contient déjà des déclencheurs
+    has_triggers = any(trigger in original_prompt.lower() for trigger in orchestration_triggers)
+    
+    if not has_triggers:
+        # Ajouter un contexte d'orchestration
+        return f"Please orchestrate with your collaborator agents to comprehensively address this request: {original_prompt}"
+    
+    return original_prompt
+
 def prompt_constructor(user_input, ocr):
     """Construit le prompt avec gestion des fichiers"""
     # Gestion du cas où user_input est une string simple (depuis chat_input)
@@ -606,3 +760,28 @@ def prompt_constructor(user_input, ocr):
         user_prompt = msg
     
     return user_prompt
+
+# FONCTION DE VALIDATION DE CONFIGURATION
+def validate_multi_agent_setup():
+    """Valide la configuration multi-agent complète"""
+    issues = []
+    
+    # Vérifier les IDs d'agents
+    for agent_key, agent_info in AGENTS.items():
+        if agent_key not in AGENT_IDS or not AGENT_IDS[agent_key]:
+            issues.append(f"ID manquant pour {agent_info['name']}")
+        if agent_key not in AGENT_ALIAS_IDS or not AGENT_ALIAS_IDS[agent_key]:
+            issues.append(f"Alias ID manquant pour {agent_info['name']}")
+    
+    # Vérifier la configuration spécifique du routeur
+    if "router" in AGENT_IDS:
+        router_id = AGENT_IDS["router"]
+        if not router_id:
+            issues.append("Agent routeur non configuré")
+    
+    return {
+        "valid": len(issues) == 0,
+        "issues": issues,
+        "total_agents": len(AGENTS),
+        "configured_agents": len([k for k in AGENTS.keys() if k in AGENT_IDS and AGENT_IDS[k]])
+    }
